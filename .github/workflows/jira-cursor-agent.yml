@@ -1,0 +1,108 @@
+name: Jira Cursor Agent
+
+on:
+  repository_dispatch:
+    types:
+      - jira_ticket_assigned
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  cursor-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Cursor CLI
+        run: npm install -g @cursor-ai/cli
+
+      - name: Verify Cursor CLI
+        run: cursor --version
+
+      - name: Prepare branch and prompt data
+        id: prep
+        env:
+          ISSUE_KEY: ${{ github.event.client_payload.issueKey }}
+          SUMMARY: ${{ github.event.client_payload.summary }}
+          DESCRIPTION: ${{ github.event.client_payload.description }}
+        run: |
+          set -euo pipefail
+          TS="$(date +%Y%m%d%H%M%S)"
+          RAW_KEY="${ISSUE_KEY:-jira-ticket}"
+          SAFE_KEY="$(echo "${RAW_KEY}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')"
+          SAFE_KEY="${SAFE_KEY#-}"
+          SAFE_KEY="${SAFE_KEY%-}"
+          if [ -z "${SAFE_KEY}" ]; then SAFE_KEY="jira-ticket"; fi
+          BRANCH="cursor/${SAFE_KEY}-${TS}"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "prompt<<EOF"
+            echo "You are implementing a Jira-driven request."
+            echo "Issue key: ${ISSUE_KEY:-N/A}"
+            echo "Summary: ${SUMMARY:-N/A}"
+            echo "Description:"
+            echo "${DESCRIPTION:-No description provided.}"
+            echo ""
+            echo "Keep changes minimal and relevant to this ticket."
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create branch
+        run: git checkout -b "${{ steps.prep.outputs.branch }}"
+
+      - name: Run Cursor headless
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CURSOR_API_KEY:-}" ]; then
+            echo "CURSOR_API_KEY is required in repository secrets"
+            exit 1
+          fi
+          cursor agent --print --force "${{ steps.prep.outputs.prompt }}"
+
+      - name: Detect changes
+        id: changes
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit and push changes
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          ISSUE_KEY: ${{ github.event.client_payload.issueKey }}
+          SUMMARY: ${{ github.event.client_payload.summary }}
+        run: |
+          set -euo pipefail
+          git config user.name "cursor-bot"
+          git config user.email "cursor-bot@users.noreply.github.com"
+          git add .
+          git commit -m "${ISSUE_KEY:-JIRA}: ${SUMMARY:-Automated update from Cursor}"
+          git push --set-upstream origin "${{ steps.prep.outputs.branch }}"
+
+      - name: Create pull request
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_KEY: ${{ github.event.client_payload.issueKey }}
+          SUMMARY: ${{ github.event.client_payload.summary }}
+        run: |
+          set -euo pipefail
+          gh pr create \
+            --title "${ISSUE_KEY:-JIRA}: ${SUMMARY:-Automated Cursor update}" \
+            --body "Automated PR generated from Jira repository_dispatch event."
