@@ -1,0 +1,2 @@
+cursor: create test PR from jira
+
